@@ -14,7 +14,6 @@ import it.aruba.delivery.request.entity.DeliveryRequest;
 import it.aruba.delivery.request.entity.DeliveryRequestRecipient;
 import it.aruba.delivery.request.exception.InvalidRecipientException;
 import it.aruba.delivery.request.exception.ResourceNotFoundException;
-import it.aruba.delivery.request.http.RecipientClient;
 import it.aruba.delivery.request.kafka.DeliveryEventPublisher;
 import it.aruba.delivery.request.repository.DeliveryRequestRecipientRepository;
 import it.aruba.delivery.request.repository.DeliveryRequestRepository;
@@ -32,7 +31,7 @@ public class DeliveryService {
 
 	private final DeliveryRequestRepository requestRepo;
 	private final DeliveryRequestRecipientRepository recipientRepo;
-	private final RecipientClient recipientClient;
+	private final RecipientService recipientService;
 	private final DeliveryEventPublisher eventPublisher;
 	private final DocumentDeliverySimulator documentDeliverySimulator;
 
@@ -43,45 +42,27 @@ public class DeliveryService {
 		// dal DTO costrusico l'entity
 		DeliveryRequest dr = buildRequest(request);
 		// verifica stato validità con chiamata REST al recipients-service
-		try {
-			validateRecipients(request.getRecipientIds());
-			dr.setStatus(RequestStatus.PENDING);
-		} catch (InvalidRecipientException ex) {
-
-			log.warn("Validation failed: {}", ex.getMessage());
-
-			dr.setStatus(RequestStatus.FAILED);
-			dr.setFailureReason(ex.getMessage());
-			dr.setCompletedAt(LocalDateTime.now());
-
-			dr = requestRepo.save(dr);
-			saveRecipients(dr.getId(), request.getRecipientIds());
-
-			return dr;
+		if (!areRecipientsValid(request.getRecipientIds())) {
+			return failRequest(dr, request.getRecipientIds(), "Invalid recipients");
 		}
 
 		// salvo richiesta e relazione
 		dr = requestRepo.save(dr);
 		saveRecipients(dr.getId(), request.getRecipientIds());
 
-		// Inizio invio
-		RequestStatus oldStatus = dr.getStatus();
-		updateStatus(dr, RequestStatus.PROCESSING, null);
-		publishStatusChanged(oldStatus, RequestStatus.PROCESSING, dr.getId());
+		// primo cambio di stato e notifica
+		changeStatus(dr, RequestStatus.PROCESSING);
 
 		// simulazione invio documento
 		boolean delivered = documentDeliverySimulator.sendDocument(dr.getDocumentName(), dr.getDocumentType());
+
 		log.info("Document delivery result for request {}: {}", dr.getId(), delivered);
 
 		// stato finale
-		oldStatus = dr.getStatus();
-
 		if (delivered) {
-			updateStatus(dr, RequestStatus.COMPLETED, null);
-			publishStatusChanged(oldStatus, RequestStatus.COMPLETED, dr.getId());
+			changeStatus(dr, RequestStatus.COMPLETED);
 		} else {
-			updateStatus(dr, RequestStatus.FAILED, "Document delivery failed");
-			publishStatusChanged(oldStatus, RequestStatus.FAILED, dr.getId());
+			changeStatus(dr, RequestStatus.FAILED, "Document delivery failed");
 		}
 
 		return dr;
@@ -105,13 +86,23 @@ public class DeliveryService {
 		}
 	}
 
-	private void publishStatusChanged(RequestStatus oldStatus, RequestStatus newStatus, Integer requestId) {
-		RequestStatusChangedEvent event = RequestStatusChangedEvent.builder().requestId(requestId).oldStatus(oldStatus)
+	private void changeStatus(DeliveryRequest dr, RequestStatus newStatus) {
+		changeStatus(dr, newStatus, null);
+	}
+
+	private void changeStatus(DeliveryRequest dr, RequestStatus newStatus, String reason) {
+
+		RequestStatus oldStatus = dr.getStatus();
+
+		updateStatus(dr, newStatus, reason);
+
+		RequestStatusChangedEvent event = RequestStatusChangedEvent.builder().requestId(dr.getId()).oldStatus(oldStatus)
 				.newStatus(newStatus).timestamp(LocalDateTime.now()).build();
+
 		try {
 			eventPublisher.publishStatusChanged(event);
 		} catch (Exception ex) {
-			log.error("Kafka Event not send", ex);
+			log.error("Kafka Event not sent for request {}", dr.getId(), ex);
 		}
 	}
 
@@ -139,14 +130,13 @@ public class DeliveryService {
 	}
 
 	private List<RecipientDto> enrichRecipients(List<DeliveryRequestRecipient> links) {
-
 		return links.stream().map(this::mapToRecipientDto).toList();
 	}
 
 	private RecipientDto mapToRecipientDto(DeliveryRequestRecipient link) {
 
 		try {
-			RecipientResponse r = recipientClient.getRecipient(link.getRecipientId());
+			RecipientResponse r = recipientService.getRecipient(link.getRecipientId());
 
 			return RecipientDto.builder().id(r.getId()).name(r.getName()).surname(r.getSurname())
 					.digitalAddress(r.getDigitalAddress()).build();
@@ -168,26 +158,53 @@ public class DeliveryService {
 	}
 
 	private DeliveryRequest buildRequest(CreateDeliveryRequest request) {
-		return DeliveryRequest.builder().requestType(request.getRequestType()).createdAt(LocalDateTime.now())
-				.documentName(request.getDocumentName()).documentType(request.getDocumentType()).build();
-	}
-
-	private void validateRecipients(List<String> recipientIds) {
-
-		for (String recipientId : recipientIds) {
-
-			RecipientResponse recipient = recipientClient.getRecipient(recipientId);
-
-			if (recipient.getValidityStatus() != ValidityStatus.VALID) {
-				throw new InvalidRecipientException("Invalid recipient: " + recipientId);
-			}
-		}
+		return DeliveryRequest.builder()
+				.requestType(request.getRequestType())
+				.createdAt(LocalDateTime.now())
+				.documentName(request.getDocumentName())
+				.documentType(request.getDocumentType())
+				.status(RequestStatus.PENDING)
+				.build();
 	}
 
 	private void saveRecipients(Integer requestId, List<String> recipientIds) {
 
 		for (String recipientId : recipientIds) {
 			recipientRepo.save(new DeliveryRequestRecipient(null, requestId, recipientId));
+		}
+	}
+
+	private DeliveryRequest failRequest(DeliveryRequest dr, List<String> recipientIds, String reason) {
+        //salva sul db il fallimento della verifica
+		dr.setStatus(RequestStatus.FAILED);
+		dr.setFailureReason(reason);
+		dr.setCompletedAt(LocalDateTime.now());
+
+		dr = requestRepo.save(dr);
+		saveRecipients(dr.getId(), recipientIds);
+
+		return dr;
+	}
+
+	private boolean areRecipientsValid(List<String> recipientIds) {
+		try {
+			validateRecipients(recipientIds);
+			return true; 
+		} catch (InvalidRecipientException ex) {
+			log.warn("Validation failed: {}", ex.getMessage());
+			return false;
+		}
+	}
+	
+	private void validateRecipients(List<String> recipientIds) {
+        //per ogni id chiama il recipient service e verifica che il contatto è valido
+		for (String recipientId : recipientIds) {
+
+			RecipientResponse recipient = recipientService.getRecipient(recipientId);
+
+			if (recipient.getValidityStatus() != ValidityStatus.VALID) {
+				throw new InvalidRecipientException("Invalid recipient: " + recipientId);
+			}
 		}
 	}
 }
