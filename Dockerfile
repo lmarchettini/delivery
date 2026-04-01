@@ -1,3 +1,3 @@
 FROM eclipse-temurin:21-jdk-jammy
-COPY delivery-request-0.0.1-SNAPSHOT.jar app.jar
+COPY target/delivery.request-0.0.1-SNAPSHOT.jar app.jar
 ENTRYPOINT ["java","-jar","/app.jar"]
